@@ -1,0 +1,41 @@
+services:
+  xiaozhi-admin:
+    build: .
+    container_name: xiaozhi-admin
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    volumes:
+      # Docker socket — needed to restart the xiaozhi + litellm containers
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Xiaozhi server data directory (host path from docker inspect)
+      - /opt/xiaozhi-esp32-server/main/xiaozhi-server/data:/data
+      # LiteLLM config — admin writes this, litellm container reads it
+      - ./litellm_config.yaml:/litellm_config.yaml
+      # API keys — persisted on host so they survive rebuilds
+      - ./api_keys.env:/api_keys.env
+    environment:
+      - CONFIG_PATH=/data/.config.yaml
+      - LITELLM_CONFIG_PATH=/litellm_config.yaml
+      - API_KEYS_PATH=/api_keys.env
+      - CONTAINER_NAME=xiaozhi-esp32-server
+      - LITELLM_CONTAINER_NAME=litellm
+      - PORT=8081
+    networks:
+      - xiaozhi-server_default
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-latest
+    container_name: litellm
+    restart: unless-stopped
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml:ro
+    env_file:
+      - api_keys.env
+    networks:
+      - xiaozhi-server_default
+
+networks:
+  xiaozhi-server_default:
+    external: true
