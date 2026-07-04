@@ -4,6 +4,7 @@
 #include "system_reset.h"
 #include "application.h"
 #include "button.h"
+#include "settings.h"
 #include "assets/lang_config.h"
 #include "led/single_led.h"
 
@@ -11,6 +12,7 @@
 #include <wifi_station.h>
 
 #include <esp_log.h>
+#include <esp_system.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
@@ -32,6 +34,7 @@ private:
     Button touch_button_;
     Button volume_up_button_;
     Button volume_down_button_;
+    Button server_toggle_button_;
 
     void InitDisplayI2C() {
         i2c_master_bus_config_t bus_config = {
@@ -92,6 +95,16 @@ private:
         );
     }
 
+    void ShowServerIndicator() {
+        Settings wifi_settings("wifi", false);
+        std::string ota_url = wifi_settings.GetString("ota_url");
+        // Empty means using CONFIG_OTA_URL (baked-in default = self-hosted)
+        bool is_xiaozhi = (ota_url == OTA_URL_XIAOZHI);
+        const char* label = is_xiaozhi ? "Server: Xiaozhi" : "Server: Self-hosted";
+        ESP_LOGI(TAG, "OTA URL: %s -> %s", ota_url.empty() ? "(default)" : ota_url.c_str(), label);
+        GetDisplay()->ShowNotification(label, 5000);
+    }
+
     void InitButtons() {
         // Boot 按钮：切换聊天 / 复位 WiFi
         /*
@@ -140,6 +153,33 @@ private:
             GetDisplay()->ShowNotification(Lang::Strings::MUTED);
         });
         */
+
+        // Server toggle: long-press GPIO43 to switch OTA between self-hosted and Xiaozhi
+        server_toggle_button_.OnLongPress([this]() {
+            Settings wifi_settings("wifi", true);
+            std::string current = wifi_settings.GetString("ota_url");
+            std::string new_url;
+            std::string label;
+
+            // Empty means using CONFIG_OTA_URL (the baked-in default).
+            // The patched binary has self-hosted as default, so empty = self-hosted.
+            bool is_currently_xiaozhi = (current == OTA_URL_XIAOZHI);
+            if (is_currently_xiaozhi) {
+                new_url = OTA_URL_SELF_HOSTED;
+                label = "OTA -> Self-hosted";
+            } else {
+                new_url = OTA_URL_XIAOZHI;
+                label = "OTA -> Xiaozhi";
+            }
+
+            wifi_settings.SetString("ota_url", new_url);
+            ESP_LOGI(TAG, "Server toggled: %s", new_url.c_str());
+            GetDisplay()->ShowNotification(label.c_str(), 3000);
+
+            // Reboot after a short delay so the user sees the notification
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            esp_restart();
+        });
     }
 
 public:
@@ -147,12 +187,14 @@ public:
         boot_button_(BOOT_BUTTON_GPIO),
         touch_button_(TOUCH_BUTTON_GPIO),
         volume_up_button_(VOLUME_UP_BUTTON_GPIO),
-        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO) {
+        volume_down_button_(VOLUME_DOWN_BUTTON_GPIO),
+        server_toggle_button_(SERVER_TOGGLE_BUTTON_GPIO) {
 
         ESP_LOGI(TAG, "Init SeeedStudioS3WifiBoard");
         InitDisplayI2C();
         InitializeSsd1306Display();
         InitButtons();
+        ShowServerIndicator();
     }
 
     virtual Led* GetLed() override {

@@ -21,6 +21,8 @@ services:
       - CONTAINER_NAME=xiaozhi-esp32-server
       - LITELLM_CONTAINER_NAME=litellm
       - PORT=8081
+      - ADMIN_USER=${ADMIN_USER:-santi}
+      - ADMIN_PASS=${ADMIN_PASS:-xiaozhi2026}
     networks:
       - xiaozhi-server_default
 

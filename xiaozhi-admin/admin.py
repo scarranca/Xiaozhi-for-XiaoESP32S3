@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Xiaozhi Admin Panel — lightweight config editor for the Xiaozhi server."""
 
+import hashlib
 import json
 import logging
 import os
+import secrets
+import time
 
 import docker
 import yaml
@@ -17,6 +20,247 @@ CONTAINER_NAME = os.environ.get("CONTAINER_NAME", "xiaozhi-server")
 LITELLM_CONTAINER_NAME = os.environ.get("LITELLM_CONTAINER_NAME", "litellm")
 LITELLM_CONFIG_PATH = os.environ.get("LITELLM_CONFIG_PATH", "/litellm_config.yaml")
 API_KEYS_PATH = os.environ.get("API_KEYS_PATH", "/api_keys.env")
+
+# ---------------------------------------------------------------------------
+# Authentication
+# ---------------------------------------------------------------------------
+
+import sqlite3
+
+DB_PATH = os.environ.get("DB_PATH", "/data/admin.db")
+
+# In-memory session store: token → {user_id, username, expiry}
+_sessions: dict[str, dict] = {}
+SESSION_MAX_AGE = 60 * 60 * 24  # 24 hours
+
+
+def init_db():
+    """Create tables if they don't exist."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
+        created_at REAL DEFAULT (strftime('%s','now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        device_id TEXT NOT NULL,
+        name TEXT DEFAULT '',
+        FOREIGN KEY (user_id) REFERENCES users(id),
+        UNIQUE(device_id)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS pairing_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        code TEXT UNIQUE NOT NULL,
+        expires_at REAL NOT NULL,
+        used INTEGER DEFAULT 0,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+    )""")
+    conn.commit()
+    # Seed admin user if no users exist
+    row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
+    if row[0] == 0:
+        admin_user = os.environ.get("ADMIN_USER", "santi")
+        admin_pass = os.environ.get("ADMIN_PASS", "xiaozhi2026")
+        pw_hash = hashlib.sha256(admin_pass.encode()).hexdigest()
+        conn.execute("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                     (admin_user, pw_hash))
+        conn.commit()
+        log.info("Created admin user: %s", admin_user)
+    conn.close()
+
+
+def get_db():
+    return sqlite3.connect(DB_PATH)
+
+
+def _check_session(request: web.Request) -> bool:
+    token = request.cookies.get("session")
+    if not token:
+        return False
+    sess = _sessions.get(token)
+    if sess is None or time.time() > sess["expiry"]:
+        _sessions.pop(token, None)
+        return False
+    return True
+
+
+def _get_session_user(request: web.Request) -> dict | None:
+    token = request.cookies.get("session")
+    if not token:
+        return None
+    sess = _sessions.get(token)
+    if sess is None or time.time() > sess["expiry"]:
+        return None
+    return sess
+
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    # Allow login/register pages without auth
+    if request.path in ("/login", "/api/login", "/register", "/api/register"):
+        return await handler(request)
+    if not _check_session(request):
+        if request.path.startswith("/api/"):
+            return web.json_response({"error": "unauthorized"}, status=401)
+        raise web.HTTPFound("/login")
+    return await handler(request)
+
+
+async def handle_login_page(request):
+    return web.Response(text=LOGIN_HTML, content_type="text/html")
+
+
+async def handle_register_page(request):
+    return web.Response(text=REGISTER_HTML, content_type="text/html")
+
+
+async def handle_login_api(request):
+    body = await request.json()
+    user = body.get("username", "").strip().lower()
+    pw = body.get("password", "")
+    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
+
+    db = get_db()
+    row = db.execute("SELECT id, username, is_admin FROM users WHERE username = ? AND password_hash = ?",
+                     (user, pw_hash)).fetchone()
+    db.close()
+
+    if row:
+        token = secrets.token_hex(32)
+        _sessions[token] = {"user_id": row[0], "username": row[1], "is_admin": bool(row[2]),
+                            "expiry": time.time() + SESSION_MAX_AGE}
+        resp = web.json_response({"ok": True})
+        resp.set_cookie("session", token, max_age=SESSION_MAX_AGE, httponly=True, samesite="Lax")
+        log.info("Login successful for user: %s", user)
+        return resp
+    log.warning("Failed login attempt for user: %s", user)
+    return web.json_response({"error": "Invalid username or password"}, status=401)
+
+
+async def handle_register_api(request):
+    body = await request.json()
+    user = body.get("username", "").strip().lower()
+    pw = body.get("password", "")
+    device_mac = body.get("device_id", "").strip().lower()
+
+    if not user or not pw:
+        return web.json_response({"error": "Username and password are required"}, status=400)
+    if len(pw) < 6:
+        return web.json_response({"error": "Password must be at least 6 characters"}, status=400)
+    pw_hash = hashlib.sha256(pw.encode()).hexdigest()
+    db = get_db()
+    try:
+        cursor = db.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", (user, pw_hash))
+        user_id = cursor.lastrowid
+        if device_mac:
+            db.execute("INSERT INTO devices (user_id, device_id, name) VALUES (?, ?, ?)",
+                       (user_id, device_mac, f"{user}'s device"))
+        db.commit()
+        log.info("New user registered: %s, device: %s", user, device_mac)
+        # Auto-login
+        token = secrets.token_hex(32)
+        _sessions[token] = {"user_id": user_id, "username": user, "is_admin": False,
+                            "expiry": time.time() + SESSION_MAX_AGE}
+        resp = web.json_response({"ok": True})
+        resp.set_cookie("session", token, max_age=SESSION_MAX_AGE, httponly=True, samesite="Lax")
+        return resp
+    except sqlite3.IntegrityError as e:
+        db.rollback()
+        if "users.username" in str(e):
+            return web.json_response({"error": "Username already taken"}, status=409)
+        if "devices.device_id" in str(e):
+            return web.json_response({"error": "This device is already registered to another account"}, status=409)
+        return web.json_response({"error": str(e)}, status=409)
+    finally:
+        db.close()
+
+
+import re
+
+
+def get_seen_devices() -> list[dict]:
+    """Parse xiaozhi-server logs for unique device-ids that have connected."""
+    try:
+        client = get_docker_client()
+        container = client.containers.get(CONTAINER_NAME)
+        logs = container.logs(tail=2000).decode(errors="replace")
+        pattern = re.compile(r"'device-id':\s*'([^']+)'")
+        seen = {}
+        for line in logs.splitlines():
+            m = pattern.search(line)
+            if m:
+                did = m.group(1).lower()
+                # Extract timestamp and IP if available
+                ts_match = re.match(r"(\d{6} \d{2}:\d{2}:\d{2})", line)
+                ip_match = re.search(r"(\d+\.\d+\.\d+\.\d+) conn", line)
+                seen[did] = {
+                    "device_id": did,
+                    "last_seen": ts_match.group(1) if ts_match else "",
+                    "ip": ip_match.group(1) if ip_match else "",
+                }
+        return list(seen.values())
+    except Exception as e:
+        log.error("Error reading device logs: %s", e)
+        return []
+
+
+async def handle_list_devices(request):
+    """List devices seen in server logs, marking which are already claimed."""
+    sess = _get_session_user(request)
+    if not sess:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    seen = get_seen_devices()
+    db = get_db()
+    # Get all paired devices
+    paired = {}
+    for row in db.execute("SELECT device_id, user_id, name FROM devices").fetchall():
+        paired[row[0]] = {"user_id": row[1], "name": row[2]}
+    db.close()
+    result = []
+    for d in seen:
+        info = {**d, "claimed": d["device_id"] in paired}
+        if d["device_id"] in paired:
+            info["owner_id"] = paired[d["device_id"]]["user_id"]
+            info["name"] = paired[d["device_id"]]["name"]
+        result.append(info)
+    return web.json_response({"devices": result})
+
+
+async def handle_claim_device(request):
+    """Claim an unclaimed device for the logged-in user."""
+    sess = _get_session_user(request)
+    if not sess:
+        return web.json_response({"error": "unauthorized"}, status=401)
+    body = await request.json()
+    device_id = body.get("device_id", "").strip().lower()
+    name = body.get("name", "").strip() or "My device"
+    if not device_id:
+        return web.json_response({"error": "device_id required"}, status=400)
+    db = get_db()
+    try:
+        db.execute("INSERT INTO devices (user_id, device_id, name) VALUES (?, ?, ?)",
+                   (sess["user_id"], device_id, name))
+        db.commit()
+        log.info("Device %s claimed by user %s", device_id, sess["username"])
+        db.close()
+        return web.json_response({"ok": True})
+    except sqlite3.IntegrityError:
+        db.rollback()
+        db.close()
+        return web.json_response({"error": "Device already claimed"}, status=409)
+
+
+async def handle_logout(request):
+    token = request.cookies.get("session")
+    _sessions.pop(token, None)
+    resp = web.HTTPFound("/login")
+    resp.del_cookie("session")
+    return resp
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -373,6 +617,8 @@ async def handle_post_config(request):
             cfg.setdefault("TTS", {}).setdefault("EdgeTTS", {})["voice"] = updates["tts_voice"]
         if "language" in updates:
             cfg["language"] = updates["language"]
+        if "timezone" in updates:
+            cfg["timezone"] = updates["timezone"]
 
         # Point Xiaozhi at LiteLLM proxy instead of directly at OpenAI
         cfg.setdefault("LLM", {}).setdefault("OpenAILLM", {})["base_url"] = "http://litellm:4000/v1"
@@ -441,9 +687,12 @@ HTML = r"""<!DOCTYPE html>
       <h1 class="text-2xl font-bold tracking-tight">Xiaozhi Admin</h1>
       <p class="text-sm text-gray-400 mt-1">Configure your voice assistant</p>
     </div>
-    <div id="status-badge" class="flex items-center gap-2 text-sm px-3 py-1.5 rounded-full bg-gray-800">
-      <span id="status-dot" class="w-2 h-2 rounded-full bg-gray-500"></span>
-      <span id="status-text">Loading…</span>
+    <div class="flex items-center gap-3">
+      <div id="status-badge" class="flex items-center gap-2 text-sm px-3 py-1.5 rounded-full bg-gray-800">
+        <span id="status-dot" class="w-2 h-2 rounded-full bg-gray-500"></span>
+        <span id="status-text">Loading…</span>
+      </div>
+      <a href="/logout" class="text-xs text-gray-500 hover:text-gray-300 transition-colors">Logout</a>
     </div>
   </div>
 
@@ -711,6 +960,51 @@ HTML = r"""<!DOCTYPE html>
       </select>
     </div>
 
+    <!-- Timezone -->
+    <div>
+      <label class="block text-sm font-medium text-gray-300 mb-1.5" for="timezone">Timezone</label>
+      <select id="timezone"
+        class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+        <optgroup label="Americas">
+          <option value="America/Mexico_City">Mexico City (CST, UTC-6)</option>
+          <option value="America/Cancun">Cancun (EST, UTC-5)</option>
+          <option value="America/Tijuana">Tijuana (PST, UTC-8)</option>
+          <option value="America/Monterrey">Monterrey (CST, UTC-6)</option>
+          <option value="America/New_York">New York (EST, UTC-5)</option>
+          <option value="America/Chicago">Chicago (CST, UTC-6)</option>
+          <option value="America/Denver">Denver (MST, UTC-7)</option>
+          <option value="America/Los_Angeles">Los Angeles (PST, UTC-8)</option>
+          <option value="America/Bogota">Bogota (COT, UTC-5)</option>
+          <option value="America/Lima">Lima (PET, UTC-5)</option>
+          <option value="America/Santiago">Santiago (CLT, UTC-3)</option>
+          <option value="America/Buenos_Aires">Buenos Aires (ART, UTC-3)</option>
+          <option value="America/Sao_Paulo">Sao Paulo (BRT, UTC-3)</option>
+          <option value="America/Toronto">Toronto (EST, UTC-5)</option>
+          <option value="America/Vancouver">Vancouver (PST, UTC-8)</option>
+        </optgroup>
+        <optgroup label="Europe">
+          <option value="Europe/London">London (GMT, UTC+0)</option>
+          <option value="Europe/Madrid">Madrid (CET, UTC+1)</option>
+          <option value="Europe/Paris">Paris (CET, UTC+1)</option>
+          <option value="Europe/Berlin">Berlin (CET, UTC+1)</option>
+          <option value="Europe/Rome">Rome (CET, UTC+1)</option>
+          <option value="Europe/Amsterdam">Amsterdam (CET, UTC+1)</option>
+          <option value="Europe/Moscow">Moscow (MSK, UTC+3)</option>
+          <option value="Europe/Istanbul">Istanbul (TRT, UTC+3)</option>
+        </optgroup>
+        <optgroup label="Asia / Pacific">
+          <option value="Asia/Dubai">Dubai (GST, UTC+4)</option>
+          <option value="Asia/Kolkata">India (IST, UTC+5:30)</option>
+          <option value="Asia/Shanghai">China (CST, UTC+8)</option>
+          <option value="Asia/Tokyo">Tokyo (JST, UTC+9)</option>
+          <option value="Asia/Seoul">Seoul (KST, UTC+9)</option>
+          <option value="Asia/Singapore">Singapore (SGT, UTC+8)</option>
+          <option value="Australia/Sydney">Sydney (AEST, UTC+10)</option>
+          <option value="Pacific/Auckland">Auckland (NZST, UTC+12)</option>
+        </optgroup>
+      </select>
+    </div>
+
     <!-- Buttons -->
     <div class="flex gap-3 pt-2">
       <button id="save-btn" onclick="saveConfig()"
@@ -723,6 +1017,23 @@ HTML = r"""<!DOCTYPE html>
       </button>
     </div>
   </form>
+
+  <!-- Devices Section -->
+  <div class="mt-8 border border-gray-800 rounded-xl p-5">
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <h2 class="text-sm font-semibold text-gray-200">My Devices</h2>
+        <p class="text-xs text-gray-500 mt-0.5">Devices that have connected to the server</p>
+      </div>
+      <button onclick="loadDevices()" type="button"
+        class="bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium text-xs rounded-lg px-3 py-2 transition-colors">
+        Refresh
+      </button>
+    </div>
+    <div id="devices-list" class="space-y-2">
+      <p class="text-xs text-gray-500">Loading...</p>
+    </div>
+  </div>
 
 <!-- API Keys Modal -->
 <div id="keys-modal" class="modal-backdrop hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60" onclick="if(event.target===this)closeKeysModal()">
@@ -862,6 +1173,7 @@ async function loadConfig() {
     el('llm_model').value = (c.LLM && c.LLM.OpenAILLM && c.LLM.OpenAILLM.model_name) || 'gpt-4o-mini';
     el('tts_voice').value = (c.TTS && c.TTS.EdgeTTS && c.TTS.EdgeTTS.voice) || 'en-US-AriaNeural';
     el('language').value = c.language || 'en';
+    el('timezone').value = c.timezone || 'America/Mexico_City';
 
     // API keys
     const keys = data.api_keys || {};
@@ -890,6 +1202,7 @@ async function saveConfig() {
         llm_model: el('llm_model').value,
         tts_voice: el('tts_voice').value,
         language: el('language').value,
+        timezone: el('timezone').value,
       },
       api_keys: {
         OPENAI_API_KEY: el('openai_key').value,
@@ -927,6 +1240,46 @@ async function loadLogs() {
 }
 
 loadConfig();
+
+async function loadDevices() {
+  try {
+    const res = await fetch('/api/devices');
+    const data = await res.json();
+    const list = el('devices-list');
+    if (!data.devices || data.devices.length === 0) {
+      list.innerHTML = '<p class="text-xs text-gray-500">No devices have connected yet. Power on your ESP32 and try again.</p>';
+      return;
+    }
+    list.innerHTML = data.devices.map(d => {
+      const claimed = d.claimed;
+      const badge = claimed
+        ? `<span class="text-xs px-2 py-0.5 rounded-full bg-green-900/50 text-green-400">Claimed${d.name ? ' — ' + d.name : ''}</span>`
+        : `<button onclick="claimDevice('${d.device_id}')" class="text-xs px-2.5 py-1 rounded-lg bg-blue-600 hover:bg-blue-500 text-white transition-colors">Claim</button>`;
+      return `<div class="flex items-center justify-between bg-gray-900 rounded-lg px-4 py-3">
+        <div>
+          <p class="text-sm font-mono text-gray-200">${d.device_id}</p>
+          <p class="text-xs text-gray-500">${d.ip ? d.ip + ' · ' : ''}Last seen: ${d.last_seen || 'unknown'}</p>
+        </div>
+        ${badge}
+      </div>`;
+    }).join('');
+  } catch (e) { console.error('Load devices error:', e); }
+}
+
+async function claimDevice(deviceId) {
+  try {
+    const res = await fetch('/api/claim', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ device_id: deviceId }),
+    });
+    const data = await res.json();
+    if (data.ok) { loadDevices(); }
+    else { alert(data.error || 'Could not claim device'); }
+  } catch (e) { alert('Error: ' + e.message); }
+}
+
+loadDevices();
 </script>
 </body>
 </html>
@@ -936,8 +1289,139 @@ loadConfig();
 # App
 # ---------------------------------------------------------------------------
 
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xiaozhi Admin — Login</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body { font-family: 'Inter', system-ui, sans-serif; }</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen flex items-center justify-center">
+<div class="w-full max-w-sm mx-4">
+  <div class="text-center mb-8">
+    <h1 class="text-2xl font-bold tracking-tight">Xiaozhi Admin</h1>
+    <p class="text-sm text-gray-400 mt-1">Sign in to continue</p>
+  </div>
+  <form id="login-form" class="space-y-4" onsubmit="return false;">
+    <div>
+      <label class="block text-sm font-medium text-gray-300 mb-1.5" for="username">Username</label>
+      <input id="username" type="text" autocomplete="username" autofocus
+        class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+    </div>
+    <div>
+      <label class="block text-sm font-medium text-gray-300 mb-1.5" for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password"
+        class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+    </div>
+    <div id="error" class="text-sm text-red-400 hidden"></div>
+    <button id="login-btn" onclick="doLogin()"
+      class="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium text-sm rounded-lg px-4 py-2.5 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-400">
+      Sign In
+    </button>
+  </form>
+  <p class="text-center text-sm text-gray-400 mt-6">Don't have an account? <a href="/register" class="text-blue-400 hover:text-blue-300">Create one</a></p>
+</div>
+<script>
+document.getElementById('password').addEventListener('keydown', e => { if(e.key==='Enter') doLogin(); });
+document.getElementById('username').addEventListener('keydown', e => { if(e.key==='Enter') document.getElementById('password').focus(); });
+async function doLogin() {
+  const btn = document.getElementById('login-btn');
+  const err = document.getElementById('error');
+  btn.disabled = true; btn.textContent = 'Signing in...'; err.classList.add('hidden');
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value,
+      }),
+    });
+    const data = await res.json();
+    if (data.ok) { window.location.href = '/'; }
+    else { err.textContent = data.error || 'Login failed'; err.classList.remove('hidden'); }
+  } catch(e) { err.textContent = 'Connection error'; err.classList.remove('hidden'); }
+  finally { btn.disabled = false; btn.textContent = 'Sign In'; }
+}
+</script>
+</body>
+</html>
+"""
+
+
+REGISTER_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Xiaozhi Admin — Register</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body { font-family: 'Inter', system-ui, sans-serif; }</style>
+</head>
+<body class="bg-gray-950 text-gray-100 min-h-screen flex items-center justify-center">
+<div class="w-full max-w-sm mx-4">
+  <div class="text-center mb-8">
+    <h1 class="text-2xl font-bold tracking-tight">Create Account</h1>
+    <p class="text-sm text-gray-400 mt-1">Create an account to get started</p>
+  </div>
+  <form id="register-form" class="space-y-4" onsubmit="return false;">
+    <div>
+      <label class="block text-sm font-medium text-gray-300 mb-1.5" for="username">Username</label>
+      <input id="username" type="text" autocomplete="username" autofocus
+        class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+    </div>
+    <div>
+      <label class="block text-sm font-medium text-gray-300 mb-1.5" for="password">Password</label>
+      <input id="password" type="password" autocomplete="new-password"
+        class="w-full bg-gray-900 border border-gray-700 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+    </div>
+    <div id="error" class="text-sm text-red-400 hidden"></div>
+    <button id="register-btn" onclick="doRegister()"
+      class="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium text-sm rounded-lg px-4 py-2.5 transition-colors focus:outline-none focus:ring-2 focus:ring-blue-400">
+      Create Account
+    </button>
+  </form>
+  <p class="text-center text-sm text-gray-400 mt-6">Already have an account? <a href="/login" class="text-blue-400 hover:text-blue-300">Sign in</a></p>
+</div>
+<script>
+document.getElementById('password').addEventListener('keydown', e => { if(e.key==='Enter') doRegister(); });
+async function doRegister() {
+  const btn = document.getElementById('register-btn');
+  const err = document.getElementById('error');
+  btn.disabled = true; btn.textContent = 'Creating account...'; err.classList.add('hidden');
+  try {
+    const res = await fetch('/api/register', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value,
+      }),
+    });
+    const data = await res.json();
+    if (data.ok) { window.location.href = '/'; }
+    else { err.textContent = data.error || 'Registration failed'; err.classList.remove('hidden'); }
+  } catch(e) { err.textContent = 'Connection error'; err.classList.remove('hidden'); }
+  finally { btn.disabled = false; btn.textContent = 'Create Account'; }
+}
+</script>
+</body>
+</html>
+"""
+
+
 def create_app() -> web.Application:
-    app = web.Application()
+    init_db()
+    app = web.Application(middlewares=[auth_middleware])
+    app.router.add_get("/login", handle_login_page)
+    app.router.add_post("/api/login", handle_login_api)
+    app.router.add_get("/register", handle_register_page)
+    app.router.add_post("/api/register", handle_register_api)
+    app.router.add_get("/api/devices", handle_list_devices)
+    app.router.add_post("/api/claim", handle_claim_device)
+    app.router.add_get("/logout", handle_logout)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/config", handle_get_config)
     app.router.add_post("/api/config", handle_post_config)

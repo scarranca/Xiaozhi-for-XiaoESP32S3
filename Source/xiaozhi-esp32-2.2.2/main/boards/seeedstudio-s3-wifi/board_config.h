@@ -55,4 +55,13 @@
 // compatibility with the code's constructor.
 #define TOUCH_BUTTON_GPIO GPIO_NUM_3
 
+// Server toggle button (D2 = GPIO3) — long-press switches OTA between self-hosted and Xiaozhi
+// NOTE: GPIO43 is used for UART TX, so we use GPIO3 instead.
+// This shares the pin with VOLUME_UP (which is commented out/unused).
+#define SERVER_TOGGLE_BUTTON_GPIO GPIO_NUM_3
+
+// OTA URLs for the toggle
+#define OTA_URL_SELF_HOSTED "http://5.161.234.180:803/xiaozhi/ota/"
+#define OTA_URL_XIAOZHI     "https://api.tenclass.net/xiaozhi/ota/"
+
 #endif  // BOARD_CONFIG_H_
